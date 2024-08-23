@@ -89,7 +89,7 @@ def mask_to_box(masks: torch.Tensor):
     return bbox_coords
 
 
-def _load_img_as_tensor(img_path, image_size):
+def load_img_as_tensor(img_path, image_size):
     img_pil = Image.open(img_path)
     img_np = np.array(img_pil.convert("RGB").resize((image_size, image_size)))
     if img_np.dtype == np.uint8:  # np.uint8 is expected for JPEG images
@@ -152,7 +152,7 @@ class AsyncVideoFrameLoader:
         if img is not None:
             return img
 
-        img, video_height, video_width = _load_img_as_tensor(
+        img, video_height, video_width = load_img_as_tensor(
             self.img_paths[index], self.image_size
         )
         self.video_height = video_height
@@ -176,6 +176,7 @@ def load_video_frames(
     img_mean=(0.485, 0.456, 0.406),
     img_std=(0.229, 0.224, 0.225),
     async_loading_frames=False,
+    lazy_loading_frames=False,
     compute_device=torch.device("cuda"),
 ):
     """
@@ -212,6 +213,7 @@ def load_video_frames(
     img_mean = torch.tensor(img_mean, dtype=torch.float32)[:, None, None]
     img_std = torch.tensor(img_std, dtype=torch.float32)[:, None, None]
 
+    assert not (lazy_loading_frames and async_loading_frames), 'Async loading for lazy images is not yet supported'
     if async_loading_frames:
         lazy_images = AsyncVideoFrameLoader(
             img_paths,
@@ -223,16 +225,20 @@ def load_video_frames(
         )
         return lazy_images, lazy_images.video_height, lazy_images.video_width
 
-    images = torch.zeros(num_frames, 3, image_size, image_size, dtype=torch.float32)
-    for n, img_path in enumerate(tqdm(img_paths, desc="frame loading (JPEG)")):
-        images[n], video_height, video_width = _load_img_as_tensor(img_path, image_size)
-    if not offload_video_to_cpu:
-        images = images.to(compute_device)
-        img_mean = img_mean.to(compute_device)
-        img_std = img_std.to(compute_device)
-    # normalize by mean and std
-    images -= img_mean
-    images /= img_std
+    if not lazy_loading_frames:    
+        images = torch.zeros(num_frames, 3, image_size, image_size, dtype=torch.float32)
+        for n, img_path in enumerate(tqdm(img_paths, desc="frame loading (JPEG)")):
+            images[n], video_height, video_width = load_img_as_tensor(img_path, image_size)
+        if not offload_video_to_cpu:
+            images = images.to(compute_device)
+            img_mean = img_mean.to(compute_device)
+            img_std = img_std.to(compute_device)
+        # normalize by mean and std
+        images -= img_mean
+        images /= img_std
+    else:
+        images = img_paths.copy()
+        _, video_height, video_width = load_img_as_tensor(img_paths[0], image_size)
     return images, video_height, video_width
 
 

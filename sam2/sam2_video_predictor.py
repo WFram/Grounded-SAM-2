@@ -12,7 +12,7 @@ import torch
 from tqdm import tqdm
 
 from sam2.modeling.sam2_base import NO_OBJ_SCORE, SAM2Base
-from sam2.utils.misc import concat_points, fill_holes_in_mask_scores, load_video_frames
+from sam2.utils.misc import concat_points, fill_holes_in_mask_scores, load_video_frames, load_img_as_tensor
 
 
 class SAM2VideoPredictor(SAM2Base):
@@ -28,6 +28,8 @@ class SAM2VideoPredictor(SAM2Base):
         clear_non_cond_mem_around_input=False,
         # whether to also clear non-conditioning memory of the surrounding frames (only effective when `clear_non_cond_mem_around_input` is True).
         clear_non_cond_mem_for_multi_obj=False,
+        # whether to load images once needed
+        lazy_loading_frames=False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -35,6 +37,9 @@ class SAM2VideoPredictor(SAM2Base):
         self.non_overlap_masks = non_overlap_masks
         self.clear_non_cond_mem_around_input = clear_non_cond_mem_around_input
         self.clear_non_cond_mem_for_multi_obj = clear_non_cond_mem_for_multi_obj
+        self.lazy_loading_frames = lazy_loading_frames
+        self.img_mean=(0.485, 0.456, 0.406)
+        self.img_std=(0.229, 0.224, 0.225)
 
     @torch.inference_mode()
     def init_state(
@@ -43,14 +48,19 @@ class SAM2VideoPredictor(SAM2Base):
         offload_video_to_cpu=False,
         offload_state_to_cpu=False,
         async_loading_frames=False,
+        lazy_loading_frames=False,
     ):
-        """Initialize an inference state."""
+        """Initialize a inference state."""
+        self.lazy_loading_frames = lazy_loading_frames
         compute_device = self.device  # device of the model
         images, video_height, video_width = load_video_frames(
             video_path=video_path,
             image_size=self.image_size,
             offload_video_to_cpu=offload_video_to_cpu,
             async_loading_frames=async_loading_frames,
+            lazy_loading_frames=self.lazy_loading_frames,
+            img_mean=self.img_mean,
+            img_std=self.img_std,
             compute_device=compute_device,
         )
         inference_state = {}
@@ -684,7 +694,8 @@ class SAM2VideoPredictor(SAM2Base):
             )
             processing_order = range(start_frame_idx, end_frame_idx + 1)
 
-        for frame_idx in tqdm(processing_order, desc="propagate in video"):
+        for frame_idx in processing_order:
+        # for frame_idx in tqdm(processing_order, desc="propagate in video"):
             # We skip those frames already in consolidated outputs (these are frames
             # that received input clicks or mask). Note that we cannot directly run
             # batched forward on them via `_run_single_frame_inference` because the
@@ -759,6 +770,7 @@ class SAM2VideoPredictor(SAM2Base):
     @torch.inference_mode()
     def reset_state(self, inference_state):
         """Remove all input points or mask in all frames throughout the video."""
+        self.lazy_loading_frames = False
         self._reset_tracking_results(inference_state)
         # Remove all object ids
         inference_state["obj_id_to_idx"].clear()
@@ -797,7 +809,13 @@ class SAM2VideoPredictor(SAM2Base):
         if backbone_out is None:
             # Cache miss -- we will run inference on a single image
             device = inference_state["device"]
-            image = inference_state["images"][frame_idx].to(device).float().unsqueeze(0)
+            if not self.lazy_loading_frames:
+                image = inference_state["images"][frame_idx].to(device).float().unsqueeze(0)
+            else:
+                image, _, _ = load_img_as_tensor(inference_state["images"][frame_idx], self.image_size)
+                image -= torch.tensor(self.img_mean, dtype=torch.float32)[:, None, None]
+                image /= torch.tensor(self.img_std, dtype=torch.float32)[:, None, None]
+                image = image.to(device).float().unsqueeze(0)
             backbone_out = self.forward_image(image)
             # Cache the most recent frame's feature (for repeated interactions with
             # a frame; we can use an LRU cache for more frames in the future).
